@@ -62,6 +62,39 @@ CREATE TABLE IF NOT EXISTS conflicts (
     PRIMARY KEY (manifest_id, eval_scan_id, training_scan_id)
 );
 CREATE INDEX IF NOT EXISTS idx_conflicts_eval ON conflicts(eval_scan_id);
+
+-- 抽页方案：多批清单共用人工转写原文的选页方案（整份方案存好才发编号）
+CREATE TABLE IF NOT EXISTS sampling_plans (
+    plan_id    TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+
+-- 方案入参：按提交顺序保存的清单号（生成与查询均以一份已提交资料为准）
+CREATE TABLE IF NOT EXISTS sampling_plan_manifests (
+    plan_id     TEXT NOT NULL REFERENCES sampling_plans(plan_id),
+    position    INTEGER NOT NULL,
+    manifest_id TEXT NOT NULL,
+    PRIMARY KEY (plan_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_sampling_plan_mf ON sampling_plan_manifests(manifest_id);
+
+-- 方案选出的原页（同页连通分量）及其覆盖的批次
+CREATE TABLE IF NOT EXISTS sampling_plan_pages (
+    plan_id      TEXT NOT NULL REFERENCES sampling_plans(plan_id),
+    page_index   INTEGER NOT NULL,
+    component_id INTEGER NOT NULL,
+    PRIMARY KEY (plan_id, page_index)
+);
+
+-- 每页在含它的各批各取一件：按 (方案, 页, 清单号) 固化当时选中的件号
+CREATE TABLE IF NOT EXISTS sampling_plan_picks (
+    plan_id      TEXT NOT NULL REFERENCES sampling_plans(plan_id),
+    page_index   INTEGER NOT NULL,
+    manifest_id  TEXT NOT NULL,
+    scan_id      TEXT NOT NULL,
+    PRIMARY KEY (plan_id, page_index, manifest_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sampling_picks_scan ON sampling_plan_picks(scan_id);
 """
 
 

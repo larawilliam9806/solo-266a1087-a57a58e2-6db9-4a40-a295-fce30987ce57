@@ -54,6 +54,18 @@ class ManifestIn(BaseModel):
         return [_non_empty(item) for item in v]
 
 
+class SamplingPlanIn(BaseModel):
+    manifest_ids: list[str] = Field(min_length=2, max_length=6)
+
+    @field_validator("manifest_ids")
+    @classmethod
+    def _check(cls, v: list[str]) -> list[str]:
+        ids = [_non_empty(item) for item in v]
+        if len(set(ids)) != len(ids):
+            raise ValueError("清单号必须互不相同")
+        return ids
+
+
 def create_app(db_path: str) -> FastAPI:
     db.init_db(db_path)
     app = FastAPI(title="OCR 评测清单 API", version="1.0.0")
@@ -139,6 +151,27 @@ def create_app(db_path: str) -> FastAPI:
         result = store.get_manifest(conn, manifest_id)
         if result is None:
             raise store.NotFound(f"清单 {manifest_id} 不存在")
+        return result
+
+    # -- 抽页方案（多批清单共用人工转写原文） -------------------------------
+
+    @app.post("/sampling-plans", status_code=201)
+    def post_sampling_plan(body: SamplingPlanIn, conn=conn_dep):
+        """传 2~6 个不同且正常供数的清单号，生成最少共用页的抽页方案。
+
+        共用原页超过 14 页 -> 400 提示缩小范围；无法连通 -> 409 返回各自
+        连通的批次组；成功则整份方案落库后返回方案编号。
+        """
+        with db.write_tx(conn):
+            result = store.create_sampling_plan(conn, body.manifest_ids)
+        return result
+
+    @app.get("/sampling-plans/{plan_id}")
+    def get_sampling_plan(plan_id: str, conn=conn_dep):
+        """凭方案编号查询当初选中的清单号与件号，并复核方案当前是否可用。"""
+        result = store.get_sampling_plan(conn, plan_id)
+        if result is None:
+            raise store.NotFound(f"抽页方案 {plan_id} 不存在")
         return result
 
     return app

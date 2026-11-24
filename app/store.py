@@ -8,12 +8,20 @@
 3. 清单供数状态由 conflicts 派生：无冲突 -> 按原编号供出原清单；
    有冲突 -> 暂停供数，凭清单号只返回冲突的评测件号与训练件号。
 
+抽页方案（多批清单共用人工转写原文）：
+- 原页 = 同页连通分量；共用页 = 同时含至少两批清单件号的分量。
+- 选页是最小连通超边问题：以「页覆盖的批次」为超边，求能把全部批次
+  连为一个连通组的最少超边；共用页上限 14，穷举规模可控。
+- 方案在单事务内整份落库后才发编号；件号按 (方案, 页, 清单号) 固化，
+  日后凭编号查到的始终是当初选中的件号，并对当前已提交资料复核可用性。
+
 每个公开写操作都必须包在 db.write_tx 单事务内调用：
 登记/判定变动与供数结论一并生效，任一步失败整体回滚，沿用原状态。
 """
 
 from __future__ import annotations
 
+import itertools
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -362,4 +370,379 @@ def get_manifest(conn: sqlite3.Connection, manifest_id: str) -> dict | None:
         "manifest_id": manifest_id,
         "status": "published",
         "items": [r["scan_id"] for r in items],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 抽页方案：多批清单共用人工转写原文
+# ---------------------------------------------------------------------------
+
+# 共用原页数量上限：超出即要求缩小范围，同时也把穷举规模限制在可控范围
+SHARED_PAGE_LIMIT = 14
+
+
+class SamplingInfeasible(DomainError):
+    """共用页无法把所有批次连通，返回各自连通的批次组。"""
+
+    status_code = 409
+
+    def __init__(self, groups: list[list[str]]):
+        super().__init__("共用页无法连通全部清单批次，请调整清单范围", groups=groups)
+
+
+class SamplingRangeTooLarge(DomainError):
+    """共用原页超过上限，需缩小范围。"""
+
+    status_code = 400
+
+    def __init__(self, count: int, limit: int):
+        super().__init__(
+            f"在至少两批出现的原页有 {count} 页，超过 {limit} 页上限，请缩小范围",
+            shared_page_count=count,
+            limit=limit,
+        )
+
+
+class SuspendedManifests(DomainError):
+    """入参中存在暂停供数的清单，抽页只接受正常供数的清单。"""
+
+    status_code = 409
+
+    def __init__(self, manifest_ids: list[str]):
+        super().__init__(
+            "存在暂停供数的清单，恢复供数后再发起抽页",
+            suspended_manifest_ids=manifest_ids,
+        )
+
+
+class UnknownManifests(DomainError):
+    status_code = 404
+
+    def __init__(self, manifest_ids: list[str]):
+        super().__init__("部分清单号不存在", missing_manifest_ids=manifest_ids)
+
+
+def _is_manifest_suspended(conn: sqlite3.Connection, manifest_id: str) -> bool:
+    """供数状态由 conflicts 表派生：有任一冲突行即暂停供数。"""
+    return (
+        conn.execute(
+            "SELECT 1 FROM conflicts WHERE manifest_id = ? LIMIT 1", (manifest_id,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _manifest_components(
+    conn: sqlite3.Connection, manifest_id: str
+) -> list[int]:
+    """清单内各件号当前所属的同页连通分量（即原页），去重排序。"""
+    rows = conn.execute(
+        "SELECT DISTINCT c.component_id FROM manifest_items m "
+        "JOIN scan_components c ON c.scan_id = m.scan_id "
+        "WHERE m.manifest_id = ? ORDER BY c.component_id",
+        (manifest_id,),
+    ).fetchall()
+    return [r["component_id"] for r in rows]
+
+
+def _connected_groups(
+    manifest_ids: list[str], page_to_manifests: dict[int, set[str]]
+) -> list[list[str]]:
+    """以共用页为超边，求批次的连通组；组与组内清单均按入参顺序输出。"""
+    parent = {m: m for m in manifest_ids}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for members in page_to_manifests.values():
+        members = [m for m in manifest_ids if m in members]
+        for other in members[1:]:
+            union(members[0], other)
+
+    groups: dict[str, list[str]] = {}
+    for m in manifest_ids:
+        groups.setdefault(find(m), []).append(m)
+    return list(groups.values())
+
+
+def _minimum_connecting_pages(
+    manifest_ids: list[str], shared_pages: list[int],
+    page_to_manifests: dict[int, set[str]],
+) -> list[int]:
+    """求能把全部批次连为一组的最少原页（最小连通超边集）。
+
+    按选用页数从小到大穷举；同规模按 shared_pages 中的次序取字典序最小者，
+    保证方案确定。共用页上限 14，最坏情况组合数仍可接受。
+    """
+    n = len(manifest_ids)
+    index_of = {m: i for i, m in enumerate(manifest_ids)}
+    # 预计算每页覆盖的批次位掩码，连通判定用并查集
+    masks: list[int] = []
+    for comp in shared_pages:
+        mask = 0
+        for m in page_to_manifests[comp]:
+            mask |= 1 << index_of[m]
+        masks.append(mask)
+
+    def connects(chosen: tuple[int, ...]) -> bool:
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        seen_groups = 0
+        seen_mask = 0
+        for idx in chosen:
+            mask = masks[idx]
+            seen_mask |= mask
+            bits = [i for i in range(n) if mask & (1 << i)]
+            for b in bits[1:]:
+                ra, rb = find(bits[0]), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+        # 所有批次都被某张选中页覆盖，且并查集只有一个根
+        if seen_mask != (1 << n) - 1:
+            return False
+        roots = {find(i) for i in range(n)}
+        return len(roots) == 1
+
+    for size in range(1, len(shared_pages) + 1):
+        for combo in itertools.combinations(range(len(shared_pages)), size):
+            if connects(combo):
+                return [shared_pages[i] for i in combo]
+    return []  # 无法连通，由调用方按连通组处理
+
+
+def _new_plan_id(conn: sqlite3.Connection) -> str:
+    while True:
+        plan_id = "PLN-" + uuid.uuid4().hex[:12].upper()
+        exists = conn.execute(
+            "SELECT 1 FROM sampling_plans WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        if exists is None:
+            return plan_id
+
+
+def create_sampling_plan(
+    conn: sqlite3.Connection, manifest_ids: list[str]
+) -> dict:
+    """为 2~6 个不同且正常供数的清单生成抽页方案（须包在写事务内调用）。
+
+    流程：
+    1. 校验清单号均存在且正常供数；
+    2. 以同页连通分量为原页，找出在至少两批出现的共用页；
+       超过 SHARED_PAGE_LIMIT 页 -> SamplingRangeTooLarge；
+    3. 选最少的原页把任意两批直接或间接连起来；无法连通 ->
+       SamplingInfeasible（附各自连通的批次组）；
+    4. 选出的每页在含它的各批各取一件，整份方案落库后返回编号。
+    """
+    # 1. 入参校验（去重与数量约束在路由层由 pydantic 保证，这里防御性复核）
+    manifest_ids = list(dict.fromkeys(manifest_ids))
+    if not 2 <= len(manifest_ids) <= 6:
+        raise DomainError("清单号数量必须在 2 至 6 个之间")
+
+    existing = {
+        r["manifest_id"]
+        for r in conn.execute(
+            f"SELECT manifest_id FROM manifests WHERE manifest_id IN "
+            f"({','.join('?' * len(manifest_ids))})",
+            manifest_ids,
+        )
+    }
+    missing = [m for m in manifest_ids if m not in existing]
+    if missing:
+        raise UnknownManifests(missing)
+
+    suspended = [m for m in manifest_ids if _is_manifest_suspended(conn, m)]
+    if suspended:
+        raise SuspendedManifests(suspended)
+
+    # 2. 统计原页（分量）-> 含该页件号的批次
+    page_to_manifests: dict[int, set[str]] = {}
+    for manifest_id in manifest_ids:
+        for comp in _manifest_components(conn, manifest_id):
+            page_to_manifests.setdefault(comp, set()).add(manifest_id)
+
+    shared_pages = sorted(
+        comp for comp, ms in page_to_manifests.items() if len(ms) >= 2
+    )
+    if len(shared_pages) > SHARED_PAGE_LIMIT:
+        raise SamplingRangeTooLarge(len(shared_pages), SHARED_PAGE_LIMIT)
+
+    # 3. 最少选页连通全部批次
+    chosen = _minimum_connecting_pages(
+        manifest_ids, shared_pages, page_to_manifests
+    )
+    if not chosen:
+        raise SamplingInfeasible(
+            _connected_groups(manifest_ids, page_to_manifests)
+        )
+
+    # 4. 每页在含它的各批各取一件（取件号最小者，保证确定可复现），
+    #    整份方案在同一事务内落库后才发编号
+    plan_id = _new_plan_id(conn)
+    conn.execute(
+        "INSERT INTO sampling_plans (plan_id, created_at) VALUES (?, ?)",
+        (plan_id, _now()),
+    )
+    for position, manifest_id in enumerate(manifest_ids):
+        conn.execute(
+            "INSERT INTO sampling_plan_manifests (plan_id, position, manifest_id)"
+            " VALUES (?, ?, ?)",
+            (plan_id, position, manifest_id),
+        )
+
+    pages_out: list[dict] = []
+    for page_index, comp in enumerate(chosen):
+        conn.execute(
+            "INSERT INTO sampling_plan_pages (plan_id, page_index, component_id)"
+            " VALUES (?, ?, ?)",
+            (plan_id, page_index, comp),
+        )
+        members = [m for m in manifest_ids if m in page_to_manifests[comp]]
+        picks: list[dict] = []
+        for manifest_id in members:
+            row = conn.execute(
+                "SELECT m.scan_id FROM manifest_items m "
+                "JOIN scan_components c ON c.scan_id = m.scan_id "
+                "WHERE m.manifest_id = ? AND c.component_id = ? "
+                "ORDER BY m.scan_id LIMIT 1",
+                (manifest_id, comp),
+            ).fetchone()
+            scan_id = row["scan_id"]
+            conn.execute(
+                "INSERT INTO sampling_plan_picks (plan_id, page_index, manifest_id, scan_id)"
+                " VALUES (?, ?, ?, ?)",
+                (plan_id, page_index, manifest_id, scan_id),
+            )
+            picks.append({"manifest_id": manifest_id, "scan_id": scan_id})
+        pages_out.append(
+            {
+                "page_index": page_index,
+                "component_id": comp,
+                "picks": picks,
+            }
+        )
+
+    return {
+        "plan_id": plan_id,
+        "status": "ready",
+        "manifest_ids": manifest_ids,
+        "pages": pages_out,
+    }
+
+
+def get_sampling_plan(conn: sqlite3.Connection, plan_id: str) -> dict | None:
+    """凭方案编号查询（只读，以当前一份已提交资料为准）。
+
+    始终能查到当初固化的清单号与件号；同时复核当前资料，任一情形则把原方案
+    标为不可用（status=unavailable）并给出原因：
+    - manifest_suspended：来源清单暂停供数；
+    - picks_page_split：同组（同页同批）固化件号现已分属不同原页；
+    - pages_merged：方案中两组合到了同一原页。
+    """
+    plan = conn.execute(
+        "SELECT plan_id, created_at FROM sampling_plans WHERE plan_id = ?",
+        (plan_id,),
+    ).fetchone()
+    if plan is None:
+        return None
+
+    manifest_rows = conn.execute(
+        "SELECT manifest_id FROM sampling_plan_manifests"
+        " WHERE plan_id = ? ORDER BY position",
+        (plan_id,),
+    ).fetchall()
+    manifest_ids = [r["manifest_id"] for r in manifest_rows]
+
+    page_rows = conn.execute(
+        "SELECT page_index, component_id FROM sampling_plan_pages"
+        " WHERE plan_id = ? ORDER BY page_index",
+        (plan_id,),
+    ).fetchall()
+    pick_rows = conn.execute(
+        "SELECT p.page_index, p.manifest_id, p.scan_id"
+        " FROM sampling_plan_picks p"
+        " JOIN sampling_plan_manifests m"
+        " ON m.plan_id = p.plan_id AND m.manifest_id = p.manifest_id"
+        " WHERE p.plan_id = ? ORDER BY p.page_index, m.position",
+        (plan_id,),
+    ).fetchall()
+
+    pages: list[dict] = []
+    picks_by_page: dict[int, list[dict]] = {}
+    for r in pick_rows:
+        pick = {"manifest_id": r["manifest_id"], "scan_id": r["scan_id"]}
+        picks_by_page.setdefault(r["page_index"], []).append(pick)
+    for r in page_rows:
+        pages.append(
+            {
+                "page_index": r["page_index"],
+                "component_id": r["component_id"],
+                "picks": picks_by_page.get(r["page_index"], []),
+            }
+        )
+
+    reasons: list[dict] = []
+
+    # 原因 1：来源清单暂停供数
+    suspended = [m for m in manifest_ids if _is_manifest_suspended(conn, m)]
+    if suspended:
+        reasons.append(
+            {"code": "manifest_suspended", "manifest_ids": suspended}
+        )
+
+    # 原因 2：同组件号分属不同页（以当前同页分量为准复核每个固化件号）
+    current_components: dict[str, int | None] = {}
+    for r in pick_rows:
+        if r["scan_id"] not in current_components:
+            current_components[r["scan_id"]] = _component_of(
+                conn, r["scan_id"]
+            )
+    for page in pages:
+        comps = {
+            current_components.get(p["scan_id"]) for p in page["picks"]
+        }
+        comps.discard(None)
+        if len(comps) >= 2:
+            reasons.append(
+                {"code": "picks_page_split", "page_index": page["page_index"]}
+            )
+
+    # 原因 3：两组合到同一页（方案中不同页的固化件号现属同一分量）
+    page_components_now: dict[int, set[int]] = {}
+    for page in pages:
+        comps = {
+            current_components.get(p["scan_id"]) for p in page["picks"]
+        }
+        comps.discard(None)
+        page_components_now[page["page_index"]] = comps
+    for earlier, later in itertools.combinations(
+        [p["page_index"] for p in pages], 2
+    ):
+        if page_components_now[earlier] & page_components_now[later]:
+            reasons.append(
+                {
+                    "code": "pages_merged",
+                    "page_indices": [earlier, later],
+                }
+            )
+
+    return {
+        "plan_id": plan_id,
+        "status": "unavailable" if reasons else "ready",
+        "manifest_ids": manifest_ids,
+        "pages": pages,
+        **({"unavailable_reasons": reasons} if reasons else {}),
     }
